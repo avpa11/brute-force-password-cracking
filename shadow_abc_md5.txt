@@ -1,0 +1,1 @@
+testuser:$1$saltsalt$7fq7ZEc75157blrz18yX./:18000:0:99999:7:::
