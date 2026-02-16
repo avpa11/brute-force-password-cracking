@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -44,26 +45,20 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
         else if (!strcmp(algo,"y")) job->algorithm = ALGO_YESCRYPT;
         else { fprintf(stderr, "Error: Unknown algorithm '%s'\n", algo); fclose(fp); return -1; }
 
-        // bcrypt and yescrypt have different formats
         if (job->algorithm == ALGO_BCRYPT) {
-            // bcrypt: $2b$rounds$salt_and_hash (salt=22chars, hash=31chars, total=53chars)
-            // We need: salt="rounds$22char_salt", hash="31char_hash"
             char *combined = p2+1;
             if (strlen(combined) < 53) { fclose(fp); return -1; }
 
-            // Extract rounds and first 22 chars of combined string
             size_t rounds_len = p2 - (p1+1);
             if (rounds_len + 1 + 22 >= MAX_SALT_LEN) { fclose(fp); return -1; }
 
-            memcpy(job->salt, p1+1, rounds_len);  // Copy rounds
+            memcpy(job->salt, p1+1, rounds_len);
             job->salt[rounds_len] = '$';
-            memcpy(job->salt + rounds_len + 1, combined, 22);  // Copy 22-char salt
+            memcpy(job->salt + rounds_len + 1, combined, 22);
             job->salt[rounds_len + 1 + 22] = 0;
 
-            // Hash is the remaining 31 chars
             strncpy(job->target_hash, combined + 22, MAX_HASH_LEN-1);
         } else if (job->algorithm == ALGO_YESCRYPT) {
-            // yescrypt: $y$params$salt$hash (has 4 fields)
             char *p3 = strchr(p2+1, '$');
             if (!p3) { fclose(fp); return -1; }
 
@@ -74,7 +69,6 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
 
             strncpy(job->target_hash, p3+1, MAX_HASH_LEN-1);
         } else {
-            // MD5, SHA256, SHA512: $algo$salt$hash (has 3 fields)
             size_t slen = p2 - (p1+1);
             if (slen >= MAX_SALT_LEN) { fclose(fp); return -1; }
             memcpy(job->salt, p1+1, slen);
@@ -95,22 +89,33 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
     return -1;
 }
 
+static ssize_t recv_full(int fd, void *buf, size_t len) {
+    size_t received = 0;
+    while (received < len) {
+        ssize_t n = recv(fd, (char *)buf + received, len - received, 0);
+        if (n <= 0) return n;
+        received += n;
+    }
+    return (ssize_t)received;
+}
+
 int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &t_total.start);
     printf("=== CONTROLLER STARTED ===\n");
 
     char *shadow = NULL, *user = NULL;
-    int port = -1, opt;
-    while ((opt = getopt(argc, argv, "f:u:p:")) != -1) {
+    int port = -1, heartbeat_sec = 0, opt;
+    while ((opt = getopt(argc, argv, "f:u:p:b:")) != -1) {
         if (opt == 'f') shadow = optarg;
         else if (opt == 'u') user = optarg;
         else if (opt == 'p') port = atoi(optarg);
+        else if (opt == 'b') heartbeat_sec = atoi(optarg);
     }
-    if (!shadow || !user || port <= 0) {
-        fprintf(stderr, "Usage: %s -f <shadow_file> -u <username> -p <port>\n", argv[0]);
+    if (!shadow || !user || port <= 0 || heartbeat_sec <= 0) {
+        fprintf(stderr, "Usage: %s -f <shadow_file> -u <username> -p <port> -b <heartbeat_seconds>\n", argv[0]);
         return 1;
     }
-    printf("Arguments: shadow_file=%s, username=%s, port=%d\n\n", shadow, user, port);
+    printf("Arguments: shadow_file=%s, username=%s, port=%d, heartbeat=%ds\n\n", shadow, user, port, heartbeat_sec);
 
     clock_gettime(CLOCK_MONOTONIC, &t_parse.start);
     CrackJob job = {0};
@@ -147,21 +152,71 @@ int main(int argc, char *argv[]) {
     send(worker, &job, sizeof(job), 0);
     clock_gettime(CLOCK_MONOTONIC, &t_dispatch.end);
     printf("Sent MSG_JOB to worker\nJob details: algorithm=%d, salt=%s\n\n", job.algorithm, job.salt);
-    printf("Worker is cracking password (searching 79³ = 493,039 candidates)...\n");
+    printf("Worker is cracking password (searching 79^3 = 493,039 candidates)...\n\n");
 
-    if (recv(worker, &msg, 1, 0) <= 0 || msg != MSG_RESULT) {
-        fprintf(stderr, "Error: Result failed\n");
+    int heartbeat_count = 0;
+    int got_result = 0;
+    CrackResult result;
+
+    while (!got_result) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(worker, &fds);
+        struct timeval tv = { .tv_sec = heartbeat_sec, .tv_usec = 0 };
+
+        int ret = select(worker + 1, &fds, NULL, NULL, &tv);
+
+        if (ret == 0) {
+            msg = MSG_HEARTBEAT_REQ;
+            send(worker, &msg, 1, 0);
+            heartbeat_count++;
+            printf("[Heartbeat #%d] Sent heartbeat request\n", heartbeat_count);
+            continue;
+        }
+
+        if (ret < 0) {
+            fprintf(stderr, "Error: select: %s\n", strerror(errno));
+            break;
+        }
+
+        if (recv(worker, &msg, 1, 0) <= 0) {
+            fprintf(stderr, "Error: Worker disconnected\n");
+            break;
+        }
+
+        if (msg == MSG_HEARTBEAT_RESP) {
+            HeartbeatResponse hb;
+            if (recv_full(worker, &hb, sizeof(hb)) <= 0) {
+                fprintf(stderr, "Error: Failed to receive heartbeat response\n");
+                break;
+            }
+            printf("[Heartbeat #%d] delta=%lu total=%lu threads=%u rate=%.0f/s\n",
+                   heartbeat_count, (unsigned long)hb.delta_tested, (unsigned long)hb.total_tested,
+                   hb.threads_active, hb.current_rate);
+        } else if (msg == MSG_RESULT) {
+            clock_gettime(CLOCK_MONOTONIC, &t_return.start);
+            if (recv_full(worker, &result, sizeof(result)) <= 0) {
+                fprintf(stderr, "Error: Failed to receive result\n");
+                break;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t_return.end);
+            got_result = 1;
+            printf("\nReceived MSG_RESULT from worker\n\n");
+        } else {
+            fprintf(stderr, "Warning: Unknown message type %d\n", msg);
+        }
+    }
+
+    if (!got_result) {
+        fprintf(stderr, "Error: Did not receive result from worker\n");
+        close(worker);
+        close(server);
         return 1;
     }
-    clock_gettime(CLOCK_MONOTONIC, &t_return.start);
-    CrackResult result;
-    recv(worker, &result, sizeof(result), 0);
-    clock_gettime(CLOCK_MONOTONIC, &t_return.end);
-    printf("Received MSG_RESULT from worker\n\n");
 
     printf("========================================\n===== PASSWORD CRACKING RESULT =====\n========================================\n");
-    if (result.found) printf("✓ Password FOUND: \"%s\"\n", result.password);
-    else printf("✗ Password NOT found (searched all 493,039 candidates)\n");
+    if (result.found) printf("  Password FOUND: \"%s\"\n", result.password);
+    else printf("  Password NOT found (searched all 493,039 candidates)\n");
 
     clock_gettime(CLOCK_MONOTONIC, &t_total.end);
     printf("\n========================================\n===== TIMING BREAKDOWN =====\n========================================\n");
@@ -169,6 +224,7 @@ int main(int argc, char *argv[]) {
     printf("Job dispatch latency:   %10.3f ms\n", get_elapsed_ms(&t_dispatch));
     printf("Worker cracking time:   %10.3f ms\n", result.worker_crack_time_ms);
     printf("Result return latency:  %10.3f ms\n", get_elapsed_ms(&t_return));
+    printf("Heartbeats exchanged:   %10d\n", heartbeat_count);
     printf("----------------------------------------\n");
     printf("Total elapsed time:     %10.3f ms\n", get_elapsed_ms(&t_total));
     printf("========================================\n");

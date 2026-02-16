@@ -1,1 +1,0 @@
-testuser:$6$saltsalt$F47U2AxU0RlDNThznWn9lNe2Zpn4a1eJ9m/LCLbj/afPiBVl78vpPtqIO9nkBmeTmcNK/3flQlTS2MMLyYygc/:18000:0:99999:7:::

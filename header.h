@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <time.h>
 
-enum { MSG_REGISTER = 1, MSG_JOB, MSG_RESULT };
+enum { MSG_REGISTER = 1, MSG_JOB, MSG_RESULT, MSG_HEARTBEAT_REQ, MSG_HEARTBEAT_RESP };
 enum { ALGO_MD5 = 1, ALGO_BCRYPT, ALGO_SHA256 = 5, ALGO_SHA512, ALGO_YESCRYPT };
 
 #define MAX_SALT_LEN     64
@@ -22,6 +22,13 @@ typedef struct {
     char password[MAX_PASSWORD_LEN];
     double worker_crack_time_ms;
 } __attribute__((packed)) CrackResult;
+
+typedef struct {
+    uint64_t delta_tested;
+    uint64_t total_tested;
+    uint32_t threads_active;
+    double current_rate;
+} __attribute__((packed)) HeartbeatResponse;
 
 typedef struct { struct timespec start, end; } Timer;
 
