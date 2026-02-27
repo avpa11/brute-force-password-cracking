@@ -10,6 +10,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 PORT=5555
 NUM_TRIALS=5
 HEARTBEAT=2
+CHUNK_SIZE=100000
 RESULTS_DIR="$ROOT_DIR/results"
 RESULTS_FILE="$RESULTS_DIR/md5_thread_experiment.csv"
 SHADOW_FILE="$ROOT_DIR/shadow/shadow_test_md5.txt"
@@ -41,7 +42,7 @@ for threads in 1 2 3 4; do
         echo -n "  Trial $trial/$NUM_TRIALS... "
 
         # Start controller in background
-        "$ROOT_DIR/controller" -f "$SHADOW_FILE" -u testuser -p $PORT -b $HEARTBEAT \
+        "$ROOT_DIR/controller" -f "$SHADOW_FILE" -u testuser -p $PORT -b $HEARTBEAT -c $CHUNK_SIZE \
             > "$RESULTS_DIR/md5_ctrl_t${threads}_r${trial}.log" 2>&1 &
         CTRL_PID=$!
         sleep 1
@@ -74,7 +75,7 @@ echo "--- MD5 with 10 thread(s) ---"
 for trial in $(seq 1 $NUM_TRIALS); do
     echo -n "  Trial $trial/$NUM_TRIALS... "
 
-    "$ROOT_DIR/controller" -f "$SHADOW_FILE" -u testuser -p $PORT -b $HEARTBEAT \
+    "$ROOT_DIR/controller" -f "$SHADOW_FILE" -u testuser -p $PORT -b $HEARTBEAT -c $CHUNK_SIZE \
         > "$RESULTS_DIR/md5_ctrl_t10_r${trial}.log" 2>&1 &
     CTRL_PID=$!
     sleep 1

@@ -9,6 +9,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 PORT=5555
 NUM_TRIALS=5
 HEARTBEAT=2
+CHUNK_SIZE=100000
 RESULTS_DIR="$ROOT_DIR/results"
 RESULTS_FILE="$RESULTS_DIR/experiment_results.csv"
 
@@ -42,11 +43,11 @@ echo ""
 extract_timings() {
     local output="$1"
     local parse=$(echo "$output" | grep "Parsing shadow file:" | awk '{print $4}')
-    local dispatch=$(echo "$output" | grep "Job dispatch latency:" | awk '{print $4}')
+    local dispatch="0"
     local worker=$(echo "$output" | grep "Worker cracking time:" | awk '{print $4}')
     local return_time=$(echo "$output" | grep "Result return latency:" | awk '{print $4}')
     local total=$(echo "$output" | grep "Total elapsed time:" | awk '{print $4}')
-    local heartbeats=$(echo "$output" | grep "Heartbeats exchanged:" | awk '{print $3}')
+    local heartbeats=$(echo "$output" | grep "Heartbeats sent:" | awk '{print $3}')
     local found=$(echo "$output" | grep -q "Password FOUND" && echo "1" || echo "0")
 
     echo "$parse,$dispatch,$worker,$return_time,$total,${heartbeats:-0},$found"
@@ -78,7 +79,7 @@ for idx in "${!ALGORITHMS[@]}"; do
             echo -n "  Trial $trial/$NUM_TRIALS... "
 
             # Start CONTROLLER in background first (it needs to listen)
-            "$ROOT_DIR/controller" -f "$shadow" -u testuser -p $PORT -b $HEARTBEAT > "$RESULTS_DIR/controller_${algo}_t${threads}_trial${trial}.log" 2>&1 &
+            "$ROOT_DIR/controller" -f "$shadow" -u testuser -p $PORT -b $HEARTBEAT -c $CHUNK_SIZE > "$RESULTS_DIR/controller_${algo}_t${threads}_trial${trial}.log" 2>&1 &
             CONTROLLER_PID=$!
 
             # Give controller time to start listening
