@@ -14,11 +14,11 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "header.h"
+#include "util.h"
 
-/* Use same search space as header (1..4 char, printable 33..111) */
-#define CRANGE PW_CRANGE
-#define CMIN   PW_CMIN
-#define CMAX   PW_CMAX
+/* Use same search space as header (1..4 char, 79-char explicit charset) */
+#define CRANGE   PW_CRANGE
+#define CHARSET  PW_CHARSET
 
 /* Boundaries: len 1 [0,79), len 2 [79,6320), len 3 [6320,499359), len 4 [499359,TOTAL) */
 #define OFF_LEN1  0ULL
@@ -53,15 +53,7 @@ typedef struct {
     int num_threads;
 } ThreadArg;
 
-/*
- * Called by cracking threads after each candidate.  When the number of
- * candidates completed in the current chunk crosses the next checkpoint
- * boundary, one thread wins a CAS and sends MSG_CHECKPOINT to the controller.
- *
- * Safe re-queue boundary: floor(tested_in_chunk / num_threads) * num_threads.
- * This guarantees every index below last_completed_idx has been visited by at
- * least one thread (one full stride-round per thread).
- */
+
 static void try_send_checkpoint(void) {
     if (g_checkpoint_interval == 0) return;
 
@@ -94,35 +86,36 @@ static double elapsed_ms(struct timespec *start) {
 
 /* Map global index to password (1, 2, 3, or 4 chars). pw must have at least 5 bytes. */
 static void idx_to_pw(uint64_t idx, char *pw) {
+    static const char cs[] = CHARSET;
     if (idx < OFF_LEN2) {
-        pw[0] = (char)(CMIN + (int)idx);
+        pw[0] = cs[idx];
         pw[1] = '\0';
         return;
     }
     if (idx < OFF_LEN3) {
         uint64_t i = idx - OFF_LEN2;
-        pw[1] = (char)(CMIN + (int)(i % CRANGE));
-        pw[0] = (char)(CMIN + (int)(i / CRANGE));
+        pw[1] = cs[i % CRANGE];
+        pw[0] = cs[i / CRANGE];
         pw[2] = '\0';
         return;
     }
     if (idx < OFF_LEN4) {
         uint64_t i = idx - OFF_LEN3;
-        pw[2] = (char)(CMIN + (int)(i % CRANGE));
+        pw[2] = cs[i % CRANGE];
         i /= CRANGE;
-        pw[1] = (char)(CMIN + (int)(i % CRANGE));
-        pw[0] = (char)(CMIN + (int)(i / CRANGE));
+        pw[1] = cs[i % CRANGE];
+        pw[0] = cs[i / CRANGE];
         pw[3] = '\0';
         return;
     }
     {
         uint64_t i = idx - OFF_LEN4;
-        pw[3] = (char)(CMIN + (int)(i % CRANGE));
+        pw[3] = cs[i % CRANGE];
         i /= CRANGE;
-        pw[2] = (char)(CMIN + (int)(i % CRANGE));
+        pw[2] = cs[i % CRANGE];
         i /= CRANGE;
-        pw[1] = (char)(CMIN + (int)(i % CRANGE));
-        pw[0] = (char)(CMIN + (int)(i / CRANGE));
+        pw[1] = cs[i % CRANGE];
+        pw[0] = cs[i / CRANGE];
         pw[4] = '\0';
     }
 }
@@ -134,9 +127,12 @@ static void *crack_chunk_thread(void *arg) {
     char pw[PW_MAX_LEN + 2];  /* up to 4 chars + null, extra for safety */
     memset(pw, 0, sizeof(pw));
     uint64_t end = ta->chunk_start + ta->chunk_count;
-    printf("  Thread %d: idx [%lu..%lu) stride %d\n",
-           ta->thread_id, (unsigned long)(ta->chunk_start + (uint64_t)ta->thread_id),
-           (unsigned long)end, ta->num_threads);
+    uint64_t my_start = ta->chunk_start + (uint64_t)ta->thread_id;
+    uint64_t my_count = (ta->chunk_count > (uint64_t)ta->thread_id)
+        ? (ta->chunk_count - (uint64_t)ta->thread_id + (uint64_t)ta->num_threads - 1) / (uint64_t)ta->num_threads
+        : 0;
+    logprintf("  Thread %d: start=%lu step=%d count=%lu\n",
+           ta->thread_id, (unsigned long)my_start, ta->num_threads, (unsigned long)my_count);
 
     for (uint64_t idx = ta->chunk_start + (uint64_t)ta->thread_id; idx < end; idx += (uint64_t)ta->num_threads) {
         if (atomic_load(&g_found)) break;
@@ -291,51 +287,55 @@ static void *reader_thread(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
-    printf("=== WORKER STARTED ===\n");
+    logprintf("=== WORKER STARTED ===\n");
 
-    char *host = NULL;
+    char *host = NULL, *logpath = NULL;
     int port = -1, num_threads = 1, opt;
-    while ((opt = getopt(argc, argv, "c:p:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:p:t:l:")) != -1) {
         if (opt == 'c') host = optarg;
         else if (opt == 'p') port = atoi(optarg);
         else if (opt == 't') num_threads = atoi(optarg);
+        else if (opt == 'l') logpath = optarg;
     }
     if (!host || port <= 0 || num_threads <= 0) {
-        fprintf(stderr, "Usage: %s -c <controller_host> -p <port> -t <threads>\n", argv[0]);
+        logerrorf("Usage: %s -c <controller_host> -p <port> -t <threads> [-l <logfile>]\n", argv[0]);
         return 1;
     }
-    printf("Arguments: controller=%s, port=%d, threads=%d\n\n", host, port, num_threads);
+    if (logpath) {
+        log_open(logpath);
+    }
+    logprintf("Arguments: controller=%s, port=%d, threads=%d\n\n", host, port, num_threads);
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     struct hostent *he = gethostbyname(host);
-    if (!he) { fprintf(stderr, "Error: Cannot resolve '%s'\n", host); return 1; }
+    if (!he) { logerrorf("Error: Cannot resolve '%s'\n", host); return 1; }
 
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(port)};
     memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
 
-    printf("Connecting to controller at %s:%d...\n", host, port);
+    logprintf("Connecting to controller at %s:%d...\n", host, port);
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "Error: Cannot connect: %s\n", strerror(errno));
+        logerrorf("Error: Cannot connect: %s\n", strerror(errno));
         return 1;
     }
-    printf("Connected to controller\n\n");
+    logprintf("Connected to controller\n\n");
 
     uint8_t msg = MSG_REGISTER;
     send(sock, &msg, 1, 0);
-    printf("Sent MSG_REGISTER to controller\nWaiting for job...\n");
+    logprintf("Sent MSG_REGISTER to controller\nWaiting for job...\n");
 
     if (recv(sock, &msg, 1, 0) <= 0 || msg != MSG_JOB) {
-        fprintf(stderr, "Error: Expected MSG_JOB\n");
+        logerrorf("Error: Expected MSG_JOB\n");
         close(sock);
         return 1;
     }
     CrackJob job;
     if (recv_full(sock, &job, sizeof(job)) <= 0) {
-        fprintf(stderr, "Error: Failed to receive job\n");
+        logerrorf("Error: Failed to receive job\n");
         close(sock);
         return 1;
     }
-    printf("Received MSG_JOB from controller\n");
+    logprintf("Received MSG_JOB from controller\n");
 
     char fmt[256];
     switch (job.algorithm) {
@@ -344,7 +344,7 @@ int main(int argc, char *argv[]) {
         case ALGO_SHA256:  snprintf(fmt, sizeof(fmt), "$5$%s$", job.salt); break;
         case ALGO_SHA512:  snprintf(fmt, sizeof(fmt), "$6$%s$", job.salt); break;
         case ALGO_YESCRYPT: snprintf(fmt, sizeof(fmt), "$y$%s", job.salt); break;
-        default: fprintf(stderr, "Error: Unsupported algorithm %d\n", job.algorithm); close(sock); return 1;
+        default: logerrorf("Error: Unsupported algorithm %d\n", job.algorithm); close(sock); return 1;
     }
 
     atomic_store(&g_tested, 0);
@@ -373,7 +373,7 @@ int main(int argc, char *argv[]) {
 
     pthread_t reader_tid;
     if (pthread_create(&reader_tid, NULL, reader_thread, &rs) != 0) {
-        fprintf(stderr, "Error: pthread_create reader\n");
+        logerrorf("Error: pthread_create reader\n");
         close(sock);
         return 1;
     }
@@ -403,7 +403,7 @@ int main(int argc, char *argv[]) {
                 res.found = 0;
                 res.password[0] = '\0';
                 res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
-                printf("STOP received (no more work or password found elsewhere). Exiting.\n");
+                logprintf("STOP received (no more work or password found elsewhere). Exiting.\n");
                 pthread_mutex_lock(&g_send_mutex);
                 msg = MSG_RESULT;
                 send(sock, &msg, 1, 0);
@@ -420,7 +420,7 @@ int main(int argc, char *argv[]) {
                 res.found = 0;
                 res.password[0] = '\0';
                 res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
-                printf("STOP (no more work). Exiting.\n");
+                logprintf("STOP (no more work). Exiting.\n");
                 pthread_mutex_lock(&g_send_mutex);
                 msg = MSG_RESULT;
                 send(sock, &msg, 1, 0);
@@ -435,11 +435,11 @@ int main(int argc, char *argv[]) {
         g_tested_at_chunk_start = atomic_load(&g_tested);
         atomic_store(&g_last_checkpoint_sent, 0);
 
-        printf("Chunk: start=%lu count=%lu\n", (unsigned long)ca.start_idx, (unsigned long)ca.count);
+        logprintf("Chunk: start=%lu count=%lu\n", (unsigned long)ca.start_idx, (unsigned long)ca.count);
         double chunk_ms;
         int chunk_found = crack_chunk(&job, fmt, ca.start_idx, ca.count, num_threads, &chunk_ms);
         if (atomic_load(&g_stop_requested)) {
-            printf("STOP received during chunk. Exiting.\n");
+            logprintf("STOP received during chunk. Exiting.\n");
             if (!found) {
                 res.found = 0;
                 res.password[0] = '\0';
@@ -460,7 +460,7 @@ int main(int argc, char *argv[]) {
             pthread_mutex_unlock(&g_password_lock);
             res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
             found = 1;
-            printf("  PASSWORD FOUND: \"%s\"\n", res.password);
+            logprintf("  PASSWORD FOUND: \"%s\"\n", res.password);
             pthread_mutex_lock(&g_send_mutex);
             msg = MSG_RESULT;
             send(sock, &msg, 1, 0);
@@ -474,7 +474,8 @@ int main(int argc, char *argv[]) {
     close(sock);
     pthread_join(reader_tid, NULL);
 
-    printf("Total tested: %lu candidates\n", (unsigned long)atomic_load(&g_tested));
-    printf("\n=== WORKER TERMINATED ===\n");
+    logprintf("Total tested: %lu candidates\n", (unsigned long)atomic_load(&g_tested));
+    logprintf("\n=== WORKER TERMINATED ===\n");
+    log_close();
     return found ? 0 : 1;
 }

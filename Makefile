@@ -4,16 +4,19 @@ LDFLAGS = -L/opt/homebrew/opt/libxcrypt/lib -lcrypt
 
 all: controller worker gen_hash
 
-controller: controller.c header.h
-	$(CC) $(CFLAGS) -o controller controller.c
+util.o: util.c util.h
+	$(CC) $(CFLAGS) -c -o util.o util.c
 
-worker: worker.c header.h
-	$(CC) $(CFLAGS) -o worker worker.c $(LDFLAGS) -pthread
+controller: controller.c header.h util.h util.o
+	$(CC) $(CFLAGS) -o controller controller.c util.o
+
+worker: worker.c header.h util.h util.o
+	$(CC) $(CFLAGS) -o worker worker.c util.o $(LDFLAGS) -pthread
 
 gen_hash: gen_hash.c
 	$(CC) $(CFLAGS) -o gen_hash gen_hash.c $(LDFLAGS)
 
 clean:
-	rm -f controller worker gen_hash
+	rm -f controller worker gen_hash util.o
 
 .PHONY: all clean

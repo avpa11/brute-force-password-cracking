@@ -8,10 +8,11 @@ enum { MSG_REGISTER = 1, MSG_JOB, MSG_RESULT, MSG_HEARTBEAT_REQ, MSG_HEARTBEAT_R
        MSG_REQUEST_CHUNK, MSG_CHUNK_ASSIGN, MSG_STOP, MSG_CHECKPOINT };
 enum { ALGO_MD5 = 1, ALGO_BCRYPT, ALGO_SHA256 = 5, ALGO_SHA512, ALGO_YESCRYPT };
 
-/* Search space: 1-, 2-, 3-, or 4-char passwords, printable ASCII 33..111 (79 chars). */
-#define PW_CMIN 33
-#define PW_CMAX 111
-#define PW_CRANGE (PW_CMAX - PW_CMIN + 1)
+/* Search space: 1-, 2-, 3-, or 4-char passwords.
+ * Charset: A-Z (26) + a-z (26) + 0-9 (10) + symbols (17) = 79 chars.
+ * Excluded: space, shell metacharacters (\ ' " ` $ !), extended Unicode. */
+#define PW_CHARSET "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@#%^&*()_+-=.,:;?"
+#define PW_CRANGE 79
 #define PW_MAX_LEN 4
 /* Total: 79 + 79^2 + 79^3 + 79^4 */
 #define TOTAL_CANDIDATES ((uint64_t)(PW_CRANGE) + (uint64_t)(PW_CRANGE)*(PW_CRANGE) + (uint64_t)(PW_CRANGE)*(PW_CRANGE)*(PW_CRANGE) + (uint64_t)(PW_CRANGE)*(PW_CRANGE)*(PW_CRANGE)*(PW_CRANGE))

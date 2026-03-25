@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <time.h>
 #include "header.h"
+#include "util.h"
 
 #define MAX_WORKERS 64
 
@@ -49,7 +50,7 @@ static const char *algo_name(uint8_t a) {
 
 static int parse_shadow(const char *path, const char *user, CrackJob *job) {
     FILE *fp = fopen(path, "r");
-    if (!fp) { fprintf(stderr, "Error: Cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+    if (!fp) { logerrorf("Error: Cannot open '%s': %s\n", path, strerror(errno)); return -1; }
 
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
@@ -68,7 +69,7 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
         else if (!strcmp(algo,"5")) job->algorithm = ALGO_SHA256;
         else if (!strcmp(algo,"6")) job->algorithm = ALGO_SHA512;
         else if (!strcmp(algo,"y")) job->algorithm = ALGO_YESCRYPT;
-        else { fprintf(stderr, "Error: Unknown algorithm '%s'\n", algo); fclose(fp); return -1; }
+        else { logerrorf("Error: Unknown algorithm '%s'\n", algo); fclose(fp); return -1; }
 
         if (job->algorithm == ALGO_BCRYPT) {
             char *combined = p2+1;
@@ -104,12 +105,12 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
         char *nl = strchr(job->target_hash, '\n');
         if (nl) *nl = 0;
 
-        printf("Parsed shadow file:\n  Algorithm: %s (ID: %d)\n  Salt: %s\n  Hash: %s\n",
+        logprintf("Parsed shadow file:\n  Algorithm: %s (ID: %d)\n  Salt: %s\n  Hash: %s\n",
                algo_name(job->algorithm), job->algorithm, job->salt, job->target_hash);
         fclose(fp);
         return 0;
     }
-    fprintf(stderr, "Error: User '%s' not found\n", user);
+    logerrorf("Error: User '%s' not found\n", user);
     fclose(fp);
     return -1;
 }
@@ -160,11 +161,11 @@ static void requeue_worker(int idx) {
             recovery_queue[recovery_count].start = resume;
             recovery_queue[recovery_count].count = end - resume;
             recovery_count++;
-            printf("[Recovery] Worker %d dead: re-queuing [%lu, %lu) (%lu candidates)\n",
+            logprintf("[Recovery] Worker %d dead: re-queuing [%lu, %lu) (%lu candidates)\n",
                    idx, (unsigned long)resume, (unsigned long)end,
                    (unsigned long)(end - resume));
         } else {
-            fprintf(stderr, "[Recovery] Worker %d dead: recovery queue full — range [%lu, %lu) LOST!\n",
+            logerrorf("[Recovery] Worker %d dead: recovery queue full — range [%lu, %lu) LOST!\n",
                     idx, (unsigned long)resume, (unsigned long)end);
         }
     }
@@ -192,26 +193,30 @@ static WorkRange next_work(uint64_t chunk_size, uint64_t *next_chunk_start_ptr) 
 
 int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &t_total.start);
-    printf("=== CONTROLLER STARTED ===\n");
+    logprintf("=== CONTROLLER STARTED ===\n");
 
-    char *shadow = NULL, *user = NULL;
+    char *shadow = NULL, *user = NULL, *logpath = NULL;
     int port = -1;
     unsigned long chunk_size = 0;
     unsigned long checkpoint_interval = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "f:u:p:b:c:k:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:u:p:b:c:k:l:")) != -1) {
         if (opt == 'f') shadow = optarg;
         else if (opt == 'u') user = optarg;
         else if (opt == 'p') port = atoi(optarg);
         else if (opt == 'b') heartbeat_interval_sec = atoi(optarg);
         else if (opt == 'c') chunk_size = (unsigned long)atol(optarg);
         else if (opt == 'k') checkpoint_interval = (unsigned long)atol(optarg);
+        else if (opt == 'l') logpath = optarg;
     }
     if (!shadow || !user || port <= 0 || heartbeat_interval_sec <= 0 || chunk_size == 0 || checkpoint_interval == 0) {
-        fprintf(stderr, "Usage: %s -f <shadow_file> -u <username> -p <port> -b <heartbeat_seconds> -c <chunk_size> -k <checkpoint_attempts>\n", argv[0]);
+        logerrorf("Usage: %s -f <shadow_file> -u <username> -p <port> -b <heartbeat_seconds> -c <chunk_size> -k <checkpoint_attempts> [-l <logfile>]\n", argv[0]);
         return 1;
     }
-    printf("Arguments: shadow_file=%s, username=%s, port=%d, heartbeat=%ds, chunk_size=%lu, checkpoint_interval=%lu\n\n",
+    if (logpath) {
+        log_open(logpath);
+    }
+    logprintf("Arguments: shadow_file=%s, username=%s, port=%d, heartbeat=%ds, chunk_size=%lu, checkpoint_interval=%lu\n\n",
            shadow, user, port, heartbeat_interval_sec, chunk_size, checkpoint_interval);
 
     clock_gettime(CLOCK_MONOTONIC, &t_parse.start);
@@ -219,17 +224,17 @@ int main(int argc, char *argv[]) {
     if (parse_shadow(shadow, user, &job) < 0) return 1;
     job.checkpoint_interval = (uint64_t)checkpoint_interval;
     clock_gettime(CLOCK_MONOTONIC, &t_parse.end);
-    printf("Search space: %lu candidates\n\n", (unsigned long)TOTAL_CANDIDATES);
+    logprintf("Search space: %lu candidates\n\n", (unsigned long)TOTAL_CANDIDATES);
 
     int server = socket(AF_INET, SOCK_STREAM, 0);
     int reuse = 1;
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     struct sockaddr_in addr = {.sin_family=AF_INET, .sin_addr.s_addr=INADDR_ANY, .sin_port=htons(port)};
     if (bind(server, (struct sockaddr*)&addr, sizeof(addr)) < 0 || listen(server, 32) < 0) {
-        fprintf(stderr, "Error: Cannot bind/listen: %s\n", strerror(errno));
+        logerrorf("Error: Cannot bind/listen: %s\n", strerror(errno));
         return 1;
     }
-    printf("Listening on port %d... (wait for workers to connect and register)\n", port);
+    logprintf("Listening on port %d... (wait for workers to connect and register)\n", port);
 
     uint64_t next_chunk_start = 0;
     g_found = 0;
@@ -278,7 +283,7 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < num_workers; i++) {
                 if (workers[i].disconnected || !workers[i].registered || workers[i].fd < 0) continue;
                 if (workers[i].pending_heartbeat) {
-                    printf("[Heartbeat #%d] Worker %d missed heartbeat — declared dead\n",
+                    logprintf("[Heartbeat #%d] Worker %d missed heartbeat — declared dead\n",
                            heartbeat_count, i);
                     requeue_worker(i);
                     remove_worker(i);
@@ -292,14 +297,14 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < num_workers; i++)
                 if (!workers[i].disconnected && workers[i].fd >= 0) active++;
             if (active > 0)
-                printf("[Heartbeat #%d] Sent heartbeat request to %d worker(s)\n", heartbeat_count, active);
+                logprintf("[Heartbeat #%d] Sent heartbeat request to %d worker(s)\n", heartbeat_count, active);
         }
 
         if (ret == 0) continue;
 
         if (ret < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "Error: select: %s\n", strerror(errno));
+            logerrorf("Error: select: %s\n", strerror(errno));
             break;
         }
 
@@ -309,7 +314,7 @@ int main(int argc, char *argv[]) {
             int client = accept(server, (struct sockaddr*)&waddr, &wlen);
             if (client >= 0) {
                 if (add_worker(client) == 0)
-                    printf("Worker connected from %s:%d (total workers: %d)\n",
+                    logprintf("Worker connected from %s:%d (total workers: %d)\n",
                            inet_ntoa(waddr.sin_addr), ntohs(waddr.sin_port), num_workers);
             }
         }
@@ -337,7 +342,7 @@ int main(int argc, char *argv[]) {
                 send(workers[i].fd, &msg, 1, 0);
                 send(workers[i].fd, &job, sizeof(job), 0);
                 clock_gettime(CLOCK_MONOTONIC, &t_last_activity);
-                printf("Sent MSG_JOB to worker %d\n", i);
+                logprintf("Sent MSG_JOB to worker %d\n", i);
                 continue;
             }
 
@@ -374,7 +379,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 workers[i].pending_heartbeat = 0;
-                printf("[Heartbeat #%d] worker %d: delta=%lu total=%lu threads=%u rate=%.0f/s\n",
+                logprintf("[Heartbeat #%d] worker %d: delta=%lu total=%lu threads=%u rate=%.0f/s\n",
                        heartbeat_count, i, (unsigned long)hb.delta_tested, (unsigned long)hb.total_tested,
                        hb.threads_active, hb.current_rate);
                 continue;
@@ -389,7 +394,7 @@ int main(int argc, char *argv[]) {
                 }
                 workers[i].last_checkpoint   = cp.last_completed_idx;
                 workers[i].pending_heartbeat = 0;  /* checkpoint counts as proof of life */
-                printf("[Checkpoint] Worker %d: safe resume idx=%lu\n",
+                logprintf("[Checkpoint] Worker %d: safe resume idx=%lu\n",
                        i, (unsigned long)cp.last_completed_idx);
                 continue;
             }
@@ -408,7 +413,7 @@ int main(int argc, char *argv[]) {
                     t_return.end = t_return.start;
                     g_result = res;
                     g_found = 1;
-                    printf("\nWorker %d reported FOUND: \"%s\"\n", i, res.password);
+                    logprintf("\nWorker %d reported FOUND: \"%s\"\n", i, res.password);
                     broadcast_stop();
                     run = 0;
                 }
@@ -422,10 +427,10 @@ int main(int argc, char *argv[]) {
             if (!workers[i].disconnected && workers[i].fd >= 0) any_active = 1;
         if (num_workers > 0 && !any_active && !g_found) {
             if (recovery_count > 0)
-                printf("All workers disconnected; %d range(s) pending — waiting for new workers\n",
+                logprintf("All workers disconnected; %d range(s) pending — waiting for new workers\n",
                        recovery_count);
             else {
-                printf("All workers disconnected; no password found.\n");
+                logprintf("All workers disconnected; no password found.\n");
                 run = 0;
             }
         }
@@ -441,23 +446,24 @@ int main(int argc, char *argv[]) {
     }
     close(server);
 
-    printf("\n========================================\n===== PASSWORD CRACKING RESULT =====\n========================================\n");
+    logprintf("\n========================================\n===== PASSWORD CRACKING RESULT =====\n========================================\n");
     if (g_result.found)
-        printf("  Password FOUND: \"%s\"\n", g_result.password);
+        logprintf("  Password FOUND: \"%s\"\n", g_result.password);
     else
-        printf("  Password NOT found (search exhausted or workers disconnected)\n");
+        logprintf("  Password NOT found (search exhausted or workers disconnected)\n");
 
-    printf("\n========================================\n===== TIMING BREAKDOWN =====\n========================================\n");
-    printf("Parsing shadow file:    %10.3f ms\n", get_elapsed_ms(&t_parse));
-    printf("Job dispatch start:     (first worker registered)\n");
-    printf("Worker cracking time:   %10.3f ms (reported by worker)\n", g_result.worker_crack_time_ms);
-    printf("Result return latency:  %10.3f ms\n", get_elapsed_ms(&t_return));
-    printf("Heartbeats sent:        %10d\n", heartbeat_count);
-    printf("Workers connected:      %10d\n", num_workers);
-    printf("----------------------------------------\n");
-    printf("Total elapsed time:     %10.3f ms\n", get_elapsed_ms(&t_total));
-    printf("========================================\n");
+    logprintf("\n========================================\n===== TIMING BREAKDOWN =====\n========================================\n");
+    logprintf("Parsing shadow file:    %10.3f ms\n", get_elapsed_ms(&t_parse));
+    logprintf("Job dispatch start:     (first worker registered)\n");
+    logprintf("Worker cracking time:   %10.3f ms (reported by worker)\n", g_result.worker_crack_time_ms);
+    logprintf("Result return latency:  %10.3f ms\n", get_elapsed_ms(&t_return));
+    logprintf("Heartbeats sent:        %10d\n", heartbeat_count);
+    logprintf("Workers connected:      %10d\n", num_workers);
+    logprintf("----------------------------------------\n");
+    logprintf("Total elapsed time:     %10.3f ms\n", get_elapsed_ms(&t_total));
+    logprintf("========================================\n");
 
-    printf("\n=== CONTROLLER TERMINATED ===\n");
+    logprintf("\n=== CONTROLLER TERMINATED ===\n");
+    log_close();
     return g_result.found ? 0 : 1;
 }
