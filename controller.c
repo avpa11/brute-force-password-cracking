@@ -21,7 +21,15 @@ typedef struct {
     int fd;
     int registered;
     int disconnected;
+    uint64_t chunk_start;       /* start of currently assigned chunk */
+    uint64_t chunk_count;       /* size of currently assigned chunk */
+    uint64_t last_checkpoint;   /* last checkpoint idx received; re-queue from here on death */
+    int pending_heartbeat;      /* 1 if we sent a req but haven't seen a response yet */
 } WorkerSlot;
+
+typedef struct { uint64_t start, count; } WorkRange;
+static WorkRange recovery_queue[MAX_WORKERS];
+static int recovery_count = 0;
 
 static WorkerSlot workers[MAX_WORKERS];
 static int num_workers = 0;
@@ -74,7 +82,7 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
             memcpy(job->salt + rounds_len + 1, combined, 22);
             job->salt[rounds_len + 1 + 22] = 0;
 
-            strncpy(job->target_hash, combined + 22, MAX_HASH_LEN-1);
+            strncpy(job->target_hash, combined, MAX_HASH_LEN-1);
         } else if (job->algorithm == ALGO_YESCRYPT) {
             char *p3 = strchr(p2+1, '$');
             if (!p3) { fclose(fp); return -1; }
@@ -84,7 +92,7 @@ static int parse_shadow(const char *path, const char *user, CrackJob *job) {
             memcpy(job->salt, p1+1, slen);
             job->salt[slen] = 0;
 
-            strncpy(job->target_hash, p3+1, MAX_HASH_LEN-1);
+            strncpy(job->target_hash, p2+1, MAX_HASH_LEN-1);
         } else {
             size_t slen = p2 - (p1+1);
             if (slen >= MAX_SALT_LEN) { fclose(fp); return -1; }
@@ -142,6 +150,46 @@ static void remove_worker(int idx) {
     workers[idx].disconnected = 1;
 }
 
+/* Re-queue a dead worker's unfinished chunk range back to the recovery queue. */
+static void requeue_worker(int idx) {
+    if (g_found || !workers[idx].registered) return;
+    uint64_t resume = workers[idx].last_checkpoint;
+    uint64_t end    = workers[idx].chunk_start + workers[idx].chunk_count;
+    if (resume < end) {
+        if (recovery_count < MAX_WORKERS) {
+            recovery_queue[recovery_count].start = resume;
+            recovery_queue[recovery_count].count = end - resume;
+            recovery_count++;
+            printf("[Recovery] Worker %d dead: re-queuing [%lu, %lu) (%lu candidates)\n",
+                   idx, (unsigned long)resume, (unsigned long)end,
+                   (unsigned long)(end - resume));
+        } else {
+            fprintf(stderr, "[Recovery] Worker %d dead: recovery queue full — range [%lu, %lu) LOST!\n",
+                    idx, (unsigned long)resume, (unsigned long)end);
+        }
+    }
+}
+
+/* Pop the next work range: recovery queue first, then sequential space. */
+static WorkRange next_work(uint64_t chunk_size, uint64_t *next_chunk_start_ptr) {
+    WorkRange r = {0, 0};
+    if (recovery_count > 0) {
+        WorkRange *rq = &recovery_queue[recovery_count - 1];
+        r.start = rq->start;
+        r.count = (rq->count > chunk_size) ? chunk_size : rq->count;
+        rq->start += r.count;
+        rq->count -= r.count;
+        if (rq->count == 0) recovery_count--;
+    } else if (*next_chunk_start_ptr < TOTAL_CANDIDATES) {
+        r.start = *next_chunk_start_ptr;
+        r.count = chunk_size;
+        if (r.start + r.count > TOTAL_CANDIDATES)
+            r.count = TOTAL_CANDIDATES - r.start;
+        *next_chunk_start_ptr += r.count;
+    }
+    return r;
+}
+
 int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &t_total.start);
     printf("=== CONTROLLER STARTED ===\n");
@@ -149,24 +197,27 @@ int main(int argc, char *argv[]) {
     char *shadow = NULL, *user = NULL;
     int port = -1;
     unsigned long chunk_size = 0;
+    unsigned long checkpoint_interval = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "f:u:p:b:c:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:u:p:b:c:k:")) != -1) {
         if (opt == 'f') shadow = optarg;
         else if (opt == 'u') user = optarg;
         else if (opt == 'p') port = atoi(optarg);
         else if (opt == 'b') heartbeat_interval_sec = atoi(optarg);
         else if (opt == 'c') chunk_size = (unsigned long)atol(optarg);
+        else if (opt == 'k') checkpoint_interval = (unsigned long)atol(optarg);
     }
-    if (!shadow || !user || port <= 0 || heartbeat_interval_sec <= 0 || chunk_size == 0) {
-        fprintf(stderr, "Usage: %s -f <shadow_file> -u <username> -p <port> -b <heartbeat_seconds> -c <chunk_size>\n", argv[0]);
+    if (!shadow || !user || port <= 0 || heartbeat_interval_sec <= 0 || chunk_size == 0 || checkpoint_interval == 0) {
+        fprintf(stderr, "Usage: %s -f <shadow_file> -u <username> -p <port> -b <heartbeat_seconds> -c <chunk_size> -k <checkpoint_attempts>\n", argv[0]);
         return 1;
     }
-    printf("Arguments: shadow_file=%s, username=%s, port=%d, heartbeat=%ds, chunk_size=%lu\n\n",
-           shadow, user, port, heartbeat_interval_sec, chunk_size);
+    printf("Arguments: shadow_file=%s, username=%s, port=%d, heartbeat=%ds, chunk_size=%lu, checkpoint_interval=%lu\n\n",
+           shadow, user, port, heartbeat_interval_sec, chunk_size, checkpoint_interval);
 
     clock_gettime(CLOCK_MONOTONIC, &t_parse.start);
     CrackJob job = {0};
     if (parse_shadow(shadow, user, &job) < 0) return 1;
+    job.checkpoint_interval = (uint64_t)checkpoint_interval;
     clock_gettime(CLOCK_MONOTONIC, &t_parse.end);
     printf("Search space: %lu candidates\n\n", (unsigned long)TOTAL_CANDIDATES);
 
@@ -210,16 +261,27 @@ int main(int argc, char *argv[]) {
         int ret = select(maxfd + 1, &fds, NULL, NULL, &tv);
 
         if (ret == 0) {
-            /* Heartbeat interval: send heartbeat request to all registered workers */
+            /* Heartbeat interval: detect dead workers first, then send requests. */
             heartbeat_count++;
             for (int i = 0; i < num_workers; i++) {
-                if (!workers[i].disconnected && workers[i].registered && workers[i].fd >= 0) {
-                    uint8_t msg = MSG_HEARTBEAT_REQ;
-                    send(workers[i].fd, &msg, 1, 0);
+                if (workers[i].disconnected || !workers[i].registered || workers[i].fd < 0) continue;
+                if (workers[i].pending_heartbeat) {
+                    /* Missed a full heartbeat interval without responding — consider dead. */
+                    printf("[Heartbeat #%d] Worker %d missed heartbeat — declared dead\n",
+                           heartbeat_count, i);
+                    requeue_worker(i);
+                    remove_worker(i);
+                    continue;
                 }
+                workers[i].pending_heartbeat = 1;
+                uint8_t hb_msg = MSG_HEARTBEAT_REQ;
+                send(workers[i].fd, &hb_msg, 1, 0);
             }
-            if (num_workers > 0)
-                printf("[Heartbeat #%d] Sent heartbeat request to %d worker(s)\n", heartbeat_count, num_workers);
+            int active = 0;
+            for (int i = 0; i < num_workers; i++)
+                if (!workers[i].disconnected && workers[i].fd >= 0) active++;
+            if (active > 0)
+                printf("[Heartbeat #%d] Sent heartbeat request to %d worker(s)\n", heartbeat_count, active);
             continue;
         }
 
@@ -247,6 +309,8 @@ int main(int argc, char *argv[]) {
             uint8_t msg;
             ssize_t n = recv(workers[i].fd, &msg, 1, 0);
             if (n <= 0) {
+                /* Unexpected disconnect — re-queue unfinished work. */
+                requeue_worker(i);
                 remove_worker(i);
                 continue;
             }
@@ -272,17 +336,18 @@ int main(int argc, char *argv[]) {
                     send(workers[i].fd, &msg, 1, 0);
                     continue;
                 }
-                if (next_chunk_start >= TOTAL_CANDIDATES) {
+                WorkRange wr = next_work(chunk_size, &next_chunk_start);
+                if (wr.count == 0) {
                     msg = MSG_STOP;
                     send(workers[i].fd, &msg, 1, 0);
                     continue;
                 }
-                uint64_t count = chunk_size;
-                if (next_chunk_start + count > TOTAL_CANDIDATES)
-                    count = TOTAL_CANDIDATES - next_chunk_start;
-                ChunkAssign ca = { .start_idx = next_chunk_start, .count = count };
-                next_chunk_start += count;
+                /* Track this chunk on the worker slot for potential re-queue. */
+                workers[i].chunk_start    = wr.start;
+                workers[i].chunk_count    = wr.count;
+                workers[i].last_checkpoint = wr.start;
 
+                ChunkAssign ca = { .start_idx = wr.start, .count = wr.count };
                 msg = MSG_CHUNK_ASSIGN;
                 send(workers[i].fd, &msg, 1, 0);
                 send(workers[i].fd, &ca, sizeof(ca), 0);
@@ -292,26 +357,45 @@ int main(int argc, char *argv[]) {
             if (msg == MSG_HEARTBEAT_RESP) {
                 HeartbeatResponse hb;
                 if (recv_full(workers[i].fd, &hb, sizeof(hb)) <= 0) {
+                    requeue_worker(i);
                     remove_worker(i);
                     continue;
                 }
+                workers[i].pending_heartbeat = 0;
                 printf("[Heartbeat #%d] worker %d: delta=%lu total=%lu threads=%u rate=%.0f/s\n",
                        heartbeat_count, i, (unsigned long)hb.delta_tested, (unsigned long)hb.total_tested,
                        hb.threads_active, hb.current_rate);
                 continue;
             }
 
-            if (msg == MSG_RESULT) {
-                CrackResult res;
-                if (recv_full(workers[i].fd, &res, sizeof(res)) <= 0) {
+            if (msg == MSG_CHECKPOINT) {
+                CheckpointReport cp;
+                if (recv_full(workers[i].fd, &cp, sizeof(cp)) <= 0) {
+                    requeue_worker(i);
                     remove_worker(i);
                     continue;
                 }
-                clock_gettime(CLOCK_MONOTONIC, &t_return.start);
-                t_return.end = t_return.start;
-                g_result = res;
-                g_found = res.found;
-                if (g_found) {
+                workers[i].last_checkpoint   = cp.last_completed_idx;
+                workers[i].pending_heartbeat = 0;  /* checkpoint counts as proof of life */
+                printf("[Checkpoint] Worker %d: safe resume idx=%lu\n",
+                       i, (unsigned long)cp.last_completed_idx);
+                continue;
+            }
+
+            if (msg == MSG_RESULT) {
+                CrackResult res;
+                if (recv_full(workers[i].fd, &res, sizeof(res)) <= 0) {
+                    requeue_worker(i);
+                    remove_worker(i);
+                    continue;
+                }
+                /* Mark chunk done so a subsequent disconnect won't re-queue it. */
+                workers[i].last_checkpoint = workers[i].chunk_start + workers[i].chunk_count;
+                if (!g_found && res.found) {
+                    clock_gettime(CLOCK_MONOTONIC, &t_return.start);
+                    t_return.end = t_return.start;
+                    g_result = res;
+                    g_found = 1;
                     printf("\nWorker %d reported FOUND: \"%s\"\n", i, res.password);
                     broadcast_stop();
                     run = 0;
@@ -320,13 +404,18 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* If we had workers and all disconnected without finding, exit */
+        /* If all workers disconnected and no recovery work is pending, exit. */
         int any_active = 0;
         for (int i = 0; i < num_workers; i++)
             if (!workers[i].disconnected && workers[i].fd >= 0) any_active = 1;
         if (num_workers > 0 && !any_active && !g_found) {
-            printf("All workers disconnected; no password found.\n");
-            run = 0;
+            if (recovery_count > 0)
+                printf("All workers disconnected; %d range(s) pending — waiting for new workers\n",
+                       recovery_count);
+            else {
+                printf("All workers disconnected; no password found.\n");
+                run = 0;
+            }
         }
     }
 

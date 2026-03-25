@@ -5,7 +5,7 @@
 #include <time.h>
 
 enum { MSG_REGISTER = 1, MSG_JOB, MSG_RESULT, MSG_HEARTBEAT_REQ, MSG_HEARTBEAT_RESP,
-       MSG_REQUEST_CHUNK, MSG_CHUNK_ASSIGN, MSG_STOP };
+       MSG_REQUEST_CHUNK, MSG_CHUNK_ASSIGN, MSG_STOP, MSG_CHECKPOINT };
 enum { ALGO_MD5 = 1, ALGO_BCRYPT, ALGO_SHA256 = 5, ALGO_SHA512, ALGO_YESCRYPT };
 
 /* Search space: 1-, 2-, 3-, or 4-char passwords, printable ASCII 33..111 (79 chars). */
@@ -24,7 +24,12 @@ typedef struct {
     uint8_t algorithm;
     char salt[MAX_SALT_LEN];
     char target_hash[MAX_HASH_LEN];
+    uint64_t checkpoint_interval;   /* candidates between checkpoint reports */
 } __attribute__((packed)) CrackJob;
+
+typedef struct {
+    uint64_t last_completed_idx;    /* absolute candidate index; resume re-queue from here */
+} __attribute__((packed)) CheckpointReport;
 
 typedef struct {
     uint8_t found;

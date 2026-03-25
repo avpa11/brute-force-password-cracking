@@ -34,6 +34,16 @@ static atomic_int g_threads_active = 0;
 static char g_password[MAX_PASSWORD_LEN];
 static pthread_mutex_t g_password_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Checkpoint state (set once before each chunk, read by cracking threads). */
+static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int              g_sock = -1;
+static uint64_t         g_checkpoint_interval  = 0;
+static uint64_t         g_current_chunk_start  = 0;
+static uint64_t         g_tested_at_chunk_start = 0;
+static int              g_num_threads_total    = 1;
+/* last value of tested_in_chunk at which we sent a checkpoint */
+static atomic_uint_least64_t g_last_checkpoint_sent = 0;
+
 typedef struct {
     const CrackJob *job;
     char fmt[256];
@@ -42,6 +52,39 @@ typedef struct {
     int thread_id;
     int num_threads;
 } ThreadArg;
+
+/*
+ * Called by cracking threads after each candidate.  When the number of
+ * candidates completed in the current chunk crosses the next checkpoint
+ * boundary, one thread wins a CAS and sends MSG_CHECKPOINT to the controller.
+ *
+ * Safe re-queue boundary: floor(tested_in_chunk / num_threads) * num_threads.
+ * This guarantees every index below last_completed_idx has been visited by at
+ * least one thread (one full stride-round per thread).
+ */
+static void try_send_checkpoint(void) {
+    if (g_checkpoint_interval == 0) return;
+
+    uint64_t total        = atomic_load(&g_tested);
+    uint64_t in_chunk     = total - g_tested_at_chunk_start;
+    uint64_t safe_done    = (in_chunk / (uint64_t)g_num_threads_total) * (uint64_t)g_num_threads_total;
+    uint64_t last_cp      = atomic_load(&g_last_checkpoint_sent);
+
+    /* Have we crossed the next multiple of checkpoint_interval? */
+    if (safe_done < g_checkpoint_interval) return;
+    uint64_t next_boundary = (last_cp / g_checkpoint_interval + 1) * g_checkpoint_interval;
+    if (safe_done < next_boundary) return;
+
+    /* Try to be the sole sender for this boundary via CAS. */
+    if (!atomic_compare_exchange_strong(&g_last_checkpoint_sent, &last_cp, safe_done)) return;
+
+    CheckpointReport cp = { .last_completed_idx = g_current_chunk_start + safe_done };
+    pthread_mutex_lock(&g_send_mutex);
+    uint8_t msg = MSG_CHECKPOINT;
+    send(g_sock, &msg, 1, 0);
+    send(g_sock, &cp, sizeof(cp), 0);
+    pthread_mutex_unlock(&g_send_mutex);
+}
 
 static double elapsed_ms(struct timespec *start) {
     struct timespec now;
@@ -116,6 +159,7 @@ static void *crack_chunk_thread(void *arg) {
         }
 
         atomic_fetch_add(&g_tested, 1);
+        try_send_checkpoint();
     }
 
     atomic_fetch_sub(&g_threads_active, 1);
@@ -208,8 +252,10 @@ static void *reader_thread(void *arg) {
                 .current_rate = rate
             };
             uint8_t resp_msg = MSG_HEARTBEAT_RESP;
+            pthread_mutex_lock(&g_send_mutex);
             send(rs->sock, &resp_msg, 1, 0);
             send(rs->sock, &hb, sizeof(hb), 0);
+            pthread_mutex_unlock(&g_send_mutex);
             continue;
         }
 
@@ -301,7 +347,11 @@ int main(int argc, char *argv[]) {
     atomic_store(&g_tested, 0);
     atomic_store(&g_last_reported, 0);
     atomic_store(&g_stop_requested, 0);
+    atomic_store(&g_last_checkpoint_sent, 0);
     g_password[0] = 0;
+    g_sock                = sock;
+    g_checkpoint_interval = job.checkpoint_interval;
+    g_num_threads_total   = num_threads;
 
     struct timespec crack_start_total;
     clock_gettime(CLOCK_MONOTONIC, &crack_start_total);
@@ -332,7 +382,10 @@ int main(int argc, char *argv[]) {
         pthread_mutex_unlock(&rs.mutex);
 
         msg = MSG_REQUEST_CHUNK;
-        if (send(sock, &msg, 1, 0) <= 0) break;
+        pthread_mutex_lock(&g_send_mutex);
+        ssize_t sent = send(sock, &msg, 1, 0);
+        pthread_mutex_unlock(&g_send_mutex);
+        if (sent <= 0) break;
 
         pthread_mutex_lock(&rs.mutex);
         while (!rs.chunk_ready && !rs.stop_received && !rs.reader_done)
@@ -348,9 +401,11 @@ int main(int argc, char *argv[]) {
                 res.password[0] = '\0';
                 res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
                 printf("STOP received (no more work or password found elsewhere). Exiting.\n");
+                pthread_mutex_lock(&g_send_mutex);
                 msg = MSG_RESULT;
                 send(sock, &msg, 1, 0);
                 send(sock, &res, sizeof(res), 0);
+                pthread_mutex_unlock(&g_send_mutex);
             }
             break;
         }
@@ -363,12 +418,19 @@ int main(int argc, char *argv[]) {
                 res.password[0] = '\0';
                 res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
                 printf("STOP (no more work). Exiting.\n");
+                pthread_mutex_lock(&g_send_mutex);
                 msg = MSG_RESULT;
                 send(sock, &msg, 1, 0);
                 send(sock, &res, sizeof(res), 0);
+                pthread_mutex_unlock(&g_send_mutex);
             }
             break;
         }
+
+        /* Reset per-chunk checkpoint state before cracking starts. */
+        g_current_chunk_start   = ca.start_idx;
+        g_tested_at_chunk_start = atomic_load(&g_tested);
+        atomic_store(&g_last_checkpoint_sent, 0);
 
         printf("Chunk: start=%lu count=%lu\n", (unsigned long)ca.start_idx, (unsigned long)ca.count);
         double chunk_ms;
@@ -379,9 +441,11 @@ int main(int argc, char *argv[]) {
                 res.found = 0;
                 res.password[0] = '\0';
                 res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
+                pthread_mutex_lock(&g_send_mutex);
                 msg = MSG_RESULT;
                 send(sock, &msg, 1, 0);
                 send(sock, &res, sizeof(res), 0);
+                pthread_mutex_unlock(&g_send_mutex);
             }
             break;
         }
@@ -394,9 +458,11 @@ int main(int argc, char *argv[]) {
             res.worker_crack_time_ms = elapsed_ms(&crack_start_total);
             found = 1;
             printf("  PASSWORD FOUND: \"%s\"\n", res.password);
+            pthread_mutex_lock(&g_send_mutex);
             msg = MSG_RESULT;
             send(sock, &msg, 1, 0);
             send(sock, &res, sizeof(res), 0);
+            pthread_mutex_unlock(&g_send_mutex);
             break;
         }
     }
