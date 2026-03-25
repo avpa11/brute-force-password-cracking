@@ -20,11 +20,12 @@
 #define CRANGE   PW_CRANGE
 #define CHARSET  PW_CHARSET
 
-/* Boundaries: len 1 [0,79), len 2 [79,6320), len 3 [6320,499359), len 4 [499359,TOTAL) */
-#define OFF_LEN1  0ULL
-#define OFF_LEN2  ((uint64_t)CRANGE)                                    /* 79 */
-#define OFF_LEN3  ((uint64_t)CRANGE + (uint64_t)CRANGE*CRANGE)          /* 6320 */
-#define OFF_LEN4  ((uint64_t)CRANGE + (uint64_t)CRANGE*CRANGE + (uint64_t)CRANGE*CRANGE*CRANGE)  /* 499359 */
+/* Priority order: 3-char first, then 4-char, then 2-char, then 1-char.
+ * Segment starts: len3 [0, C^3), len4 [C^3, C^3+C^4), len2 [C^3+C^4, C^3+C^4+C^2), len1 [C^3+C^4+C^2, TOTAL) */
+#define SEG_LEN3  0ULL
+#define SEG_LEN4  ((uint64_t)CRANGE*CRANGE*CRANGE)
+#define SEG_LEN2  (SEG_LEN4 + (uint64_t)CRANGE*CRANGE*CRANGE*CRANGE)
+#define SEG_LEN1  (SEG_LEN2 + (uint64_t)CRANGE*CRANGE)
 
 static atomic_int g_found = 0;
 static atomic_int g_stop_requested = 0;   /* set by reader thread on MSG_STOP so crack threads exit */
@@ -84,39 +85,36 @@ static double elapsed_ms(struct timespec *start) {
     return (now.tv_sec - start->tv_sec) * 1000.0 + (now.tv_nsec - start->tv_nsec) / 1e6;
 }
 
-/* Map global index to password (1, 2, 3, or 4 chars). pw must have at least 5 bytes. */
+/* Map global index to password (order: 3-char, 4-char, 2-char, 1-char). pw must have at least 5 bytes. */
 static void idx_to_pw(uint64_t idx, char *pw) {
     static const char cs[] = CHARSET;
-    if (idx < OFF_LEN2) {
-        pw[0] = cs[idx];
-        pw[1] = '\0';
-        return;
-    }
-    if (idx < OFF_LEN3) {
-        uint64_t i = idx - OFF_LEN2;
-        pw[1] = cs[i % CRANGE];
-        pw[0] = cs[i / CRANGE];
-        pw[2] = '\0';
-        return;
-    }
-    if (idx < OFF_LEN4) {
-        uint64_t i = idx - OFF_LEN3;
-        pw[2] = cs[i % CRANGE];
-        i /= CRANGE;
+    if (idx < SEG_LEN4) {
+        uint64_t i = idx - SEG_LEN3;
+        pw[2] = cs[i % CRANGE]; i /= CRANGE;
         pw[1] = cs[i % CRANGE];
         pw[0] = cs[i / CRANGE];
         pw[3] = '\0';
         return;
     }
-    {
-        uint64_t i = idx - OFF_LEN4;
-        pw[3] = cs[i % CRANGE];
-        i /= CRANGE;
-        pw[2] = cs[i % CRANGE];
-        i /= CRANGE;
+    if (idx < SEG_LEN2) {
+        uint64_t i = idx - SEG_LEN4;
+        pw[3] = cs[i % CRANGE]; i /= CRANGE;
+        pw[2] = cs[i % CRANGE]; i /= CRANGE;
         pw[1] = cs[i % CRANGE];
         pw[0] = cs[i / CRANGE];
         pw[4] = '\0';
+        return;
+    }
+    if (idx < SEG_LEN1) {
+        uint64_t i = idx - SEG_LEN2;
+        pw[1] = cs[i % CRANGE];
+        pw[0] = cs[i / CRANGE];
+        pw[2] = '\0';
+        return;
+    }
+    {
+        pw[0] = cs[idx - SEG_LEN1];
+        pw[1] = '\0';
     }
 }
 
