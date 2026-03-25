@@ -133,8 +133,10 @@ static void *crack_chunk_thread(void *arg) {
 
     char pw[PW_MAX_LEN + 2];  /* up to 4 chars + null, extra for safety */
     memset(pw, 0, sizeof(pw));
-    struct crypt_data cd;
     uint64_t end = ta->chunk_start + ta->chunk_count;
+    printf("  Thread %d: idx [%lu..%lu) stride %d\n",
+           ta->thread_id, (unsigned long)(ta->chunk_start + (uint64_t)ta->thread_id),
+           (unsigned long)end, ta->num_threads);
 
     for (uint64_t idx = ta->chunk_start + (uint64_t)ta->thread_id; idx < end; idx += (uint64_t)ta->num_threads) {
         if (atomic_load(&g_found)) break;
@@ -142,6 +144,7 @@ static void *crack_chunk_thread(void *arg) {
 
         idx_to_pw(idx, pw);
 
+        struct crypt_data cd;
         memset(&cd, 0, sizeof(cd));
         char *h = crypt_r(pw, ta->fmt, &cd);
         if (!h) continue;

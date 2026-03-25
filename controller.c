@@ -241,9 +241,8 @@ int main(int argc, char *argv[]) {
     t_last_activity = t_dispatch.start;
 
     int run = 1;
-    struct timeval tv_heartbeat;
-    tv_heartbeat.tv_sec = heartbeat_interval_sec;
-    tv_heartbeat.tv_usec = 0;
+    struct timespec last_heartbeat;
+    clock_gettime(CLOCK_MONOTONIC, &last_heartbeat);
 
     while (run) {
         fd_set fds;
@@ -257,16 +256,28 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        struct timeval tv = tv_heartbeat;
+        /* Compute remaining time until next heartbeat deadline. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed_hb = (now.tv_sec - last_heartbeat.tv_sec)
+                          + (now.tv_nsec - last_heartbeat.tv_nsec) / 1e9;
+        double remaining = heartbeat_interval_sec - elapsed_hb;
+        struct timeval tv;
+        if (remaining <= 0.0) { tv.tv_sec = 0; tv.tv_usec = 0; }
+        else { tv.tv_sec = (long)remaining; tv.tv_usec = (long)((remaining - (long)remaining) * 1e6); }
+
         int ret = select(maxfd + 1, &fds, NULL, NULL, &tv);
 
-        if (ret == 0) {
-            /* Heartbeat interval: detect dead workers first, then send requests. */
+        /* Check heartbeat deadline regardless of whether select timed out or got data. */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed_hb = (now.tv_sec - last_heartbeat.tv_sec)
+                   + (now.tv_nsec - last_heartbeat.tv_nsec) / 1e9;
+        if (elapsed_hb >= heartbeat_interval_sec) {
+            last_heartbeat = now;
             heartbeat_count++;
             for (int i = 0; i < num_workers; i++) {
                 if (workers[i].disconnected || !workers[i].registered || workers[i].fd < 0) continue;
                 if (workers[i].pending_heartbeat) {
-                    /* Missed a full heartbeat interval without responding — consider dead. */
                     printf("[Heartbeat #%d] Worker %d missed heartbeat — declared dead\n",
                            heartbeat_count, i);
                     requeue_worker(i);
@@ -282,8 +293,9 @@ int main(int argc, char *argv[]) {
                 if (!workers[i].disconnected && workers[i].fd >= 0) active++;
             if (active > 0)
                 printf("[Heartbeat #%d] Sent heartbeat request to %d worker(s)\n", heartbeat_count, active);
-            continue;
         }
+
+        if (ret == 0) continue;
 
         if (ret < 0) {
             if (errno == EINTR) continue;
